@@ -1,7 +1,7 @@
     ; Abel Doyle
     ; RCET3375
     ; Lab9-1EEPROM
-    ;git url
+    ; https://github.com/abeldoyl/Lab-9-EEPROM/tree/main/Lab9-1EEPROM.X
     
 ; PIC16F883 Configuration Bit Settings
 
