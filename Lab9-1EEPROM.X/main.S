@@ -1,7 +1,7 @@
     ; Abel Doyle
-    ; RCET3373
-    ; Lab2-4PIC
-    ; https://github.com/abeldoyl/Lab-02-PIC-I-O/tree/main/Lab2-4PIC/Lab2-4PIC.X
+    ; RCET3375
+    ; Lab9-1EEPROM
+    ;git url
     
 ; PIC16F883 Configuration Bit Settings
 
@@ -25,279 +25,249 @@
 
 ; config statements should precede project file includes.
 #include <xc.inc>
+; ---- Bank 0 variables ----
+ SysFlags    EQU 0x20   ; system flag byte (bit numbers below)
+ BtnEvents   EQU 0x21   ; button event flags set by ServiceTick, cleared by ServiceButtons
+ BtnState    EQU 0x22   ; debounced button levels: bit = 1 released (HIGH), 0 pressed
+ selCount    EQU 0x23   ; Select debounce counter (ticks)
+ wrCount     EQU 0x24   ; Write debounce counter (ticks)
+ diff        EQU 0x25   ; scratch: which pins differ from their debounced level
+ pending     EQU 0x26   ; RAM selection ('A' or 'B')
+ stored      EQU 0x27   ; value last read from EEPROM
 
-; Reset Vector at 0000h. Execution starts here after reset.
+; ---- SysFlags bit numbers ----
+ selecting   EQU 0      ; 1 = Write held, selection mode active
+
+; ---- BtnEvents bit numbers ----
+ sel_press   EQU 0      ; debounced Select press
+ wr_press    EQU 1      ; debounced Write press
+ wr_release  EQU 2      ; debounced Write release
+
+; ---- Button pin / BtnState bit numbers (RB0 = Select, RB1 = Write) ----
+ sel_bit     EQU 0
+ wr_bit      EQU 1
+
+; ---- Constants ----
+ DEBOUNCE_TICKS EQU 20  ; a pin must differ from its stable level for 20 ticks
+                        ; (~1.024 ms each at 4 MHz, TMR0 prescaler 1:4) = ~20 ms
+ ZFLAG       EQU 2      ; STATUS bit 2 = Z
+
 PSECT resetVect,class=CODE,delta=2
-ResetVector: 
+ResetVector:
     goto Setup
 
-
-; Main code section starts at 0008h. User code goes here.
 PSECT code,class=CODE,delta=2
- 
+
+; SETUP - runs once after reset, then falls into Main.
+; No interrupts are used. TMR0 free-runs as a ~1 ms tick that Main polls.
+; No EEPROM write happens here. Setup leaves Bank 0 selected.
 Setup:
-    ; add device setup here
-    ; Bank 0
-    BANKSEL PORTB	;Select PORTB
-    CLRF PORTB		;Clearing all previous data on PORTB
-    BANKSEL PORTC	;Select PORTC
-    CLRF PORTC		;Clearing all previous data on PORTC
-    
-    ; Bank 1
-    BANKSEL TRISB	;Select TRISB
-    MOVLW 0xFE		;start with Row1 output, everything else input
-    MOVWF TRISB		;"
-    BANKSEL TRISC	;Select TRISC
-    CLRF TRISC		;makes PORTC an output
-    BANKSEL WPUB	;Select WPUB
-    MOVLW 0xF0		;Weak pull-ups on RB4-RB7 (the four column inputs)
-    MOVWF WPUB		;"
-    BANKSEL OPTION_REG	;Select OPTION_REG
-    BCF OPTION_REG,7	;RBPU = 0 -> enable PORTB weak pull-ups globally
-    
-    ; Bank 3
-    BANKSEL ANSELH     ;Select ANSELH
-    CLRF ANSELH        ;PORTB pins used here are set to be digital, not analog
-    
-    goto Main
-    
+    BANKSEL ANSEL
+    CLRF ANSEL              ; all pins digital (RA1/RA2 share AN1/AN2)
+    CLRF ANSELH             ; RB0/RB1 share AN12/AN10
+
+    BANKSEL TRISA
+    MOVLW 0xF9
+    MOVWF TRISA             ; RA1, RA2 = outputs (read / write diagnostics)
+    MOVLW 0xFF
+    MOVWF TRISB             ; PORTB inputs (RB0 Select, RB1 Write)
+    CLRF TRISC              ; PORTC outputs to DLG7137 D0-D6
+
+    MOVLW 0x03
+    MOVWF WPUB              ; weak pull-ups on RB0 and RB1
+    MOVLW 0x01
+    MOVWF OPTION_REG        ; RBPU = 0 (pull-ups on); TMR0 = internal clock,
+                            ; prescaler 1:4 -> overflow every 1.024 ms
+
+    BANKSEL EEADR
+    CLRF EEADR              ; EEPROM address 0x00 (never changes in this lab)
+    BANKSEL EECON1
+    BCF EECON1,7            ; EEPGD = 0 -> data EEPROM, not program flash
+
+    BANKSEL PORTA
+    CLRF PORTA              ; RA1, RA2 diagnostics start LOW
+    CLRF PORTC
+    CLRF INTCON             ; GIE = 0, T0IF = 0
+    CLRF SysFlags           ; not selecting
+    MOVLW 0x41
+    MOVWF pending
+    CLRF BtnEvents          ; no events
+    CLRF selCount
+    CLRF wrCount
+    MOVLW 0x03
+    MOVWF BtnState          ; both buttons start as "released"
+
+; MAIN - runs the three services in a fixed order, forever.
+; Nothing in Main waits (except the ~5 ms EEPROM write), so ServiceTick
+; is reached far more often than once per millisecond.
 Main:
-    ; main code goes here
-    CLRF 0x20		;Clear register low key is set low
-    CLRF 0x21		;Clear register high key is set low
-	
-	;Scan for data on Row 1 (Pin8 & RB0) 
-	BCF 0x03,6	;Set Bank 1
-	BSF 0x03,5	;"
-	MOVLW 0xFE	;Set the RB0 output is low, RB1-RB7 input
-	MOVWF 0x86	;Send W to PortB
-        BCF 0x03,6	;Set Bank 0
-        BCF 0x03,5	;"
-	BTFSS 0x06,4	;Check Pin 4 for 1
-        BSF 0x20,1
-        BTFSS 0x06,5    ;Check Pin 3 for 2
-        BSF 0x20,2
-        BTFSS 0x06,6    ;Check Pin 2 for 3
-        BSF 0x20,3 
-        BTFSS 0x06,7    ;Check Pin 1 for A
-        BSF 0x21,2
-	
-	;Scan for data on Row 2 (Pin7 & RB1)
-	BCF 0x03,6      ;Set Bank 1
-        BSF 0x03,5      ;"
-        MOVLW 0xFD      ;Set the RB1 output-low, rest input
-        MOVWF 0x86      ;Send W to PortB
-        BCF 0x03,6      ;Set Bank 0
-        BCF 0x03,5      ;"
-        BTFSS 0x06,4    ;Check Pin 4 for 4
-        BSF 0x20,4
-        BTFSS 0x06,5    ;Check Pin 3 for 5
-        BSF 0x20,5
-        BTFSS 0x06,6    ;Check Pin 2 for 6
-        BSF 0x20,6
-        BTFSS 0x06,7    ;Check Pin 1 for B
-        BSF 0x21,3
-	
-	;Scan for data on Row 3 (Pin6 & RB2)
-	BCF 0x03,6      ;Set Bank 1
-        BSF 0x03,5      ;"
-        MOVLW 0xFB      ;Set the RB2 output-low, rest input
-        MOVWF 0x86      ;Send W to PortB
-        BCF 0x03,6      ;Set Bank 0
-        BCF 0x03,5      ;"
-        BTFSS 0x06,4    ;Check Pin 4 for 7
-        BSF 0x20,7
-        BTFSS 0x06,5    ;Check Pin 3 for 8
-        BSF 0x21,0
-        BTFSS 0x06,6    ;Check Pin 2 for 9
-        BSF 0x21,1
-        BTFSS 0x06,7    ;Check Pin 1 for C
-        BSF 0x21,4
-	
-	;Scan for data on Row 4 (Pin6 & RB3)
-	BCF 0x03,6      ;Set Bank 1
-        BSF 0x03,5      ;"
-        MOVLW 0xF7      ;Set the RB3 output-low, rest input
-        MOVWF 0x86      ;Send W to PortB
-        BCF 0x03,6      ;Set Bank 0
-        BCF 0x03,5      ;"
-        BTFSS 0x06,4    ;Check Pin 4 for *
-        BSF 0x21,6
-        BTFSS 0x06,5    ;Check Pin 3 for 0
-        BSF 0x20,0
-        BTFSS 0x06,6    ;Check Pin 2 for #
-        BSF 0x21,7
-        BTFSS 0x06,7    ;Check Pin 1 for D
-        BSF 0x21,5
-	
-    BANKSEL PORTB
-    goto PriorityEncode
-    
-    PriorityEncode:
-    
-    BTFSS   0x21,7      ;Test for if # is pressed
-    goto    TestStar
-    goto    DisplayPound
-    
-    TestStar:
-    BTFSS   0x21,6      ;Test for if * is pressed
-    goto    TestD
-    goto    DisplayStar
-    
-    TestD:
-    BTFSS   0x21,5      ;Test for if D is pressed
-    goto    TestC
-    goto    DisplayD
-    
-    TestC:
-    BTFSS   0x21,4      ;Test for if C is pressed
-    goto    TestB
-    goto    DisplayC
-    
-    TestB:
-    BTFSS   0x21,3      ;Test for if B is pressed
-    goto    TestA
-    goto    DisplayB
-    
-    TestA:
-    BTFSS   0x21,2      ;Test for if A is pressed
-    goto    Test9
-    goto    DisplayA
-    
-    Test9:
-    BTFSS   0x21,1      ;Test for if 9 is pressed
-    goto    Test8
-    goto    Display9
-    
-    Test8:
-    BTFSS   0x21,0      ;Test for if 8 is pressed
-    goto    Test7
-    goto    Display8
-    
-    Test7:
-    BTFSS   0x20,7      ;Test for if 7 is pressed
-    goto    Test6
-    goto    Display7
-    
-    Test6:
-    BTFSS   0x20,6      ;Test for if 6 is pressed
-    goto    Test5
-    goto    Display6
-    
-    Test5:
-    BTFSS   0x20,5      ;Test for if 5 is pressed
-    goto    Test4
-    goto    Display5
-    
-    Test4:
-    BTFSS   0x20,4      ;Test for if 4 is pressed
-    goto    Test3
-    goto    Display4
-    
-    Test3:
-    BTFSS   0x20,3      ;Test for if 3 is pressed
-    goto    Test2
-    goto    Display3
-    
-    Test2:
-    BTFSS   0x20,2      ;Test for if 2 is pressed
-    goto    Test1
-    goto    Display2
-    
-    Test1:
-    BTFSS   0x20,1      ;Test for if 1 is pressed 
-    goto    Test0
-    goto    Display1
-    
-    Test0:
-    BTFSS   0x20,0      ;Test for if 0 is pressed
-    goto    DisplayDefault
-    goto    Display0
-
-    
-    Display9:
-    MOVLW 0x39      ;Select the character set for display 9
-    MOVWF 0x07      ;Send W to PortC
+    CALL ServiceTick        ; debounce both buttons, raise press/release events
+    CALL ServiceButtons     ; act on events (selection mode, the one write)
+    CALL ServiceStored      ; read EEPROM and display it when not selecting
     goto Main
 
-    Display8:
-    MOVLW 0x38      ;Select the character set for display 8
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+; SERVICE TICK - debounces both buttons once per TMR0 overflow (~1 ms).
+; A pin that differs from its stable level for DEBOUNCE_TICKS ticks in a row
+; becomes the new stable level and raises one event. Any tick where the pin
+; matches the stable level restarts the count, so bounce is ignored on both
+; the press and the release.
+ServiceTick:
+    BTFSS INTCON,2          ; T0IF set? (about 1 ms has passed)
+    RETURN                  ; no: nothing to do
+    BCF INTCON,2            ; clear the tick flag
 
-    Display7:
-    MOVLW 0x37      ;Select the character set for display 7
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+    MOVF PORTB,W
+    XORWF BtnState,W        ; bit = 1 where the pin differs from its stable level
+    MOVWF diff
 
-    Display6:
-    MOVLW 0x36      ;Select the character set for display 6
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+    BTFSS diff,sel_bit      ; Select differs?
+    goto SelSteady
+    INCF selCount,F
+    MOVLW DEBOUNCE_TICKS
+    XORWF selCount,W
+    BTFSS STATUS,ZFLAG      ; reached the debounce count?
+    goto TickWrite
+    CLRF selCount
+    MOVLW 0x01
+    XORWF BtnState,F        ; accept the new Select level
+    BTFSS BtnState,sel_bit  ; new level LOW = press
+    BSF BtnEvents,sel_press ; (Select release produces no event)
+    goto TickWrite
+SelSteady:
+    CLRF selCount
 
-    Display5:
-    MOVLW 0x35      ;Select the character set for display 5
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+TickWrite:
+    BTFSS diff,wr_bit       ; Write differs?
+    goto WrSteady
+    INCF wrCount,F
+    MOVLW DEBOUNCE_TICKS
+    XORWF wrCount,W
+    BTFSS STATUS,ZFLAG
+    RETURN
+    CLRF wrCount
+    MOVLW 0x02
+    XORWF BtnState,F        ; accept the new Write level
+    BTFSC BtnState,wr_bit   ; new level HIGH = release
+    goto WrReleased
+    BSF BtnEvents,wr_press
+    RETURN
+WrReleased:
+    BSF BtnEvents,wr_release
+    RETURN
+WrSteady:
+    CLRF wrCount
+    RETURN
 
-    Display4:
-    MOVLW 0x34      ;Select the character set for display 4
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+; SERVICE BUTTONS - turns debounced events into actions.
+;   Normal mode:    Select press ignored; Write press starts selection (no write).
+;   Selecting mode: Select press toggles A/B; Write release saves ONCE and exits.
+; WriteEEPROM is called only from here, only on a debounced Write release.
+ServiceButtons:
+    BTFSC SysFlags,selecting
+    goto SelectingMode
 
-    Display3:
-    MOVLW 0x33      ;Select the character set for display 3
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+    BCF BtnEvents,sel_press ; Select alone does nothing
+    BCF BtnEvents,wr_release
+    BTFSS BtnEvents,wr_press
+    RETURN
+    BCF BtnEvents,wr_press
+    BSF SysFlags,selecting
+    CALL ShowPending
+    RETURN
 
-    Display2:
-    MOVLW 0x32      ;Select the character set for display 2
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+SelectingMode:
+    BTFSS BtnEvents,sel_press
+    goto CheckRelease
+    BCF BtnEvents,sel_press
+    MOVLW 0x03
+    XORWF pending,F         ; 'A' (0x41) <-> 'B' (0x42)
+    CALL ShowPending
 
-    Display1:
-    MOVLW 0x31      ;Select the character set for display 1
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+CheckRelease:
+    BTFSS BtnEvents,wr_release
+    RETURN
+    BCF BtnEvents,wr_release
+    BCF SysFlags,selecting
+    MOVF pending,W
+    CALL WriteEEPROM        ; the ONLY EEPROM write in the program
+    RETURN
 
-    Display0:
-    MOVLW 0x30      ;Select the character set for display 0
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+; SHOW PENDING - displays the RAM selection on the DLG7137.
+ShowPending:
+    MOVF pending,W
+    MOVWF PORTC
+    RETURN
 
-    DisplayA:
-    MOVLW 0x41      ;Select the character set for display A
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+; SERVICE STORED - when not selecting, reads EEPROM every pass and displays
+; A, B, or ? for any other value. The read pulse on RA1 is inside ReadEEPROM,
+; so display time is not part of it.
+ServiceStored:
+    BTFSC SysFlags,selecting
+    RETURN                  ; selection is shown by ServiceButtons
+    CALL ReadEEPROM         ; W = EEPROM[0x00]
+    MOVWF stored
 
-    DisplayB:
-    MOVLW 0x42      ;Select the character set for display B
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+    MOVF stored,W
+    XORLW 0x41
+    BTFSC STATUS,ZFLAG
+    goto ShowA
+    MOVF stored,W
+    XORLW 0x42
+    BTFSC STATUS,ZFLAG
+    goto ShowB
+    MOVLW 0x3F               ; '?' unrecognised data
+    MOVWF PORTC
+    RETURN
+ShowA:
+    MOVLW 0x41
+    MOVWF PORTC
+    RETURN
+ShowB:
+    MOVLW 0x42
+    MOVWF PORTC
+    RETURN
 
-    DisplayC:
-    MOVLW 0x43      ;Select the character set for display C
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+; READ EEPROM - returns EEPROM[0x00] in W. RA1 is HIGH only around the read.
+; Bank 0 on entry and exit. EEADR and EEPGD were set once in Setup.
+ReadEEPROM:
+    BSF PORTA,1             ; RA1 HIGH
+    BANKSEL EECON1
+    BSF EECON1,0            ; RD = 1 (data is valid the next cycle)
+    BANKSEL EEDATA
+    MOVF EEDATA,W
+    BANKSEL PORTA
+    BCF PORTA,1             ; RA1 LOW
+    RETURN
 
-    DisplayD:
-    MOVLW 0x44      ;Select the character set for display D
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+; WRITE EEPROM - writes W to EEPROM[0x00] and waits for it to finish.
+; RA2 is HIGH from just before the unlock sequence until WR clears.
+; Bank 0 on entry and exit. Interrupts are never enabled; GIE is cleared
+; again here so the unlock sequence is guaranteed uninterrupted.
+WriteEEPROM:
+    BANKSEL EEDATA
+    MOVWF EEDATA             ; data to write
+    BANKSEL EECON1
+    BSF EECON1,2            ; WREN = 1
+    BANKSEL PORTA
+    BSF PORTA,2             ; RA2 HIGH
+    BANKSEL EECON1
+    BCF INTCON,7            ; GIE = 0
 
-    DisplayStar:
-    MOVLW 0x2A      ;Select the character set for display *
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+    ; ---- required unlock sequence: no other instructions in between ----
+    MOVLW 0x55
+    MOVWF EECON2
+    MOVLW 0xAA
+    MOVWF EECON2
+    BSF EECON1,1            ; WR = 1 starts the write
+    ; --------------------------------------------------------------------
 
-    DisplayPound:
-    MOVLW 0x23      ;Select the character set for display #
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
-
-    DisplayDefault:
-    MOVLW 0x24      ;Select the character set for display $
-    MOVWF 0x07      ;Send W to PortC
-    goto Main
+WriteWait:
+    BTFSC EECON1,1          ; WR clears when the write is complete
+    goto WriteWait
+    BCF EECON1,2            ; WREN = 0
+    BANKSEL PIR2
+    BCF PIR2,4              ; clear EEIF
+    BANKSEL PORTA
+    BCF PORTA,2             ; RA2 LOW
+    RETURN
 End
-    
