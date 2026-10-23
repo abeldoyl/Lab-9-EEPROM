@@ -25,7 +25,7 @@
 
 ; config statements should precede project file includes.
 #include <xc.inc>
-; ============================================================================ HPapa luke is the coolest guy ever :) Jesus loves papa luke
+; ============================================================================
 ; PIN MAP
 ;   PORTB RB0-RB3 = keypad rows (driven low one at a time via TRISB)
 ;   PORTB RB4-RB7 = keypad columns (inputs, weak pull-ups)
@@ -456,7 +456,7 @@ CmpLoop:
 ServiceDisplay:
     MOVF dispChar,W
     MOVWF PORTC
-    RETURN
+    RETURN 
     
 ; ============================================================================
 ; EEPROMREAD - unchanged from Part 2
