@@ -157,7 +157,6 @@ Setup:
     CLRF ee_data
     CLRF ee_status
     CALL ClearEntry         ; no digits collected after reset
-    CALL InitPin            ; TEMPORARY: first flash only, then delete this line
     MOVLW CH_LOCKED
     MOVWF dispChar
  
@@ -457,53 +456,6 @@ CmpLoop:
 ServiceDisplay:
     MOVF dispChar,W
     MOVWF PORTC
-    RETURN
- 
-; ---- TEMPORARY: DELETE InitPin AND EEWriteByte AFTER THE FIRST FLASH ----
-; InitPin - writes the four PIN digits to EEPROM PIN_ADDR..PIN_ADDR+3.
-InitPin:
-    MOVLW PIN_ADDR
-    MOVWF ee_address
-    MOVLW 1                 ; digit 1  (change to your PIN, values 0-9)
-    MOVWF ee_data
-    CALL EEWriteByte
-    INCF ee_address,F
-    MOVLW 2                 ; digit 2
-    MOVWF ee_data
-    CALL EEWriteByte
-    INCF ee_address,F
-    MOVLW 3                 ; digit 3
-    MOVWF ee_data
-    CALL EEWriteByte
-    INCF ee_address,F
-    MOVLW 4                 ; digit 4
-    MOVWF ee_data
-    CALL EEWriteByte
-    RETURN
-
-; EEWriteByte - writes ee_data to EEPROM[ee_address] and waits until done.
-EEWriteByte:
-    BANKSEL EEADR
-    MOVF ee_address,W
-    MOVWF EEADR
-    MOVF ee_data,W
-    MOVWF EEDATA
-    BANKSEL EECON1
-    BCF EECON1,7            ; EEPGD = 0 -> data EEPROM
-    BSF EECON1,2            ; WREN = 1
-    BCF INTCON,7            ; GIE off during the unlock sequence
-    MOVLW 0x55
-    MOVWF EECON2
-    MOVLW 0xAA
-    MOVWF EECON2
-    BSF EECON1,1            ; WR = 1 starts the write
-WaitWrite:
-    BTFSC EECON1,1          ; WR clears when the write finishes
-    goto WaitWrite
-    BCF EECON1,2            ; WREN = 0
-    BANKSEL PIR2
-    BCF PIR2,4              ; clear EEIF
-    BANKSEL PORTA
     RETURN
     
 ; ============================================================================
