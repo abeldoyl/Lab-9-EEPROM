@@ -1,7 +1,7 @@
     ; Abel Doyle
     ; RCET3375
-    ; Lab9-3EEPROM
-    ; https://github.com/abeldoyl/Lab-9-EEPROM/tree/main/Lab9-3EEPROM.X
+    ; Lab9-4EEPROM
+    ; https://github.com/abeldoyl/Lab-9-EEPROM/tree/main/Lab9-4EEPROM.X
     
 ; PIC16F883 Configuration Bit Settings
 
@@ -32,11 +32,14 @@
 ;   PORTC RC0-RC6 = DLG7137 D0-D6 (ASCII)
 ;   RA0 = active buzzer (through a transistor driver)
 ;   RA1 = simulated solenoid output (LED / driver, NOT a real solenoid)
-;   Put a pull-down (e.g. 10k) on RA0 and RA1 so they stay OFF while the pins
-;   float during reset.
+;   RA2 = PIN-error indicator (LED + resistor; ON only after an EEPROM
+;         write/verify error, stays ON until power is cycled)
+;   Put a pull-down (e.g. 10k) on RA0, RA1 and RA2 so they stay OFF while the
+;   pins float during reset.
 ; ============================================================================
  BUZZER      EQU 0      ; PORTA bit
  SOLENOID    EQU 1      ; PORTA bit
+ ERR_LED     EQU 2      ; PORTA bit
  
 ; ============================================================================
 ; EEPROM routine registers (same as Part 2, common RAM 0x70-0x7F)
@@ -44,6 +47,7 @@
  ee_address  EQU 0x70
  ee_data     EQU 0x71
  ee_status   EQU 0x72
+ ee_want     EQU 0x73   ; used only inside EEPROMWrite / EEPROMVerifyWrite
  
  EEPROM_READ  EQU 0
  EEPROM_WRITE EQU 1
@@ -62,7 +66,7 @@
  keyEvent    EQU 0x26   ; debounced press event (ASCII), 0 = none
  keyIn       EQU 0x27   ; key being processed
  digit       EQU 0x28   ; numeric value of a digit key (0-9)
- pinCount    EQU 0x29   ; digits collected so far
+ ;           EQU 0x29   ; (free, was pinCount in Part 3)
  dispChar    EQU 0x2A   ; character shown on the DLG7137
  buzzCnt     EQU 0x2B   ; buzzer countdown (ticks)
  unlkL       EQU 0x2C   ; solenoid pulse countdown, low byte
@@ -75,31 +79,58 @@
  mismatch    EQU 0x33   ; OR of all digit differences during compare
  cmpIdx      EQU 0x34
  loopCnt     EQU 0x35
- pinBuf      EQU 0x38   ; 4 bytes: 0x38-0x3B (entered digits, values 0-9)
+ mode        EQU 0x36   ; 0 = invalid PIN, 1 = normal locked, 2 = PIN change
+ phase       EQU 0x37   ; PIN change mode: 0 = current PIN, 1 = new PIN x2
+ pinBuf      EQU 0x38   ; 4 bytes 0x38-0x3B: current-PIN entry (digits 0-9)
+ newBuf      EQU 0x3C   ; 8 bytes 0x3C-0x43: new PIN entry 1 then entry 2
+ entryCnt    EQU 0x44   ; keys accepted so far in this entry (digits AND #)
+ ptrIdx      EQU 0x45   ; index of next digit slot (# does not advance it)
+ result      EQU 0x46   ; match routine result: 0 busy, 1 ok, 2 fail
+ wrIdx       EQU 0x47   ; PINWrite step 0-5
  
 ; ---- SysFlags bits ----
  unlocked    EQU 0      ; 1 = solenoid output active
- entryBad    EQU 1      ; 1 = fifth digit pressed, entry already rejected
+ PIN_UPDATE  EQU 1      ; 1 = PINWrite running (or stopped by an error)
+ pinFault    EQU 2      ; 1 = EEPROM error: locked out until power cycle
+ cWait       EQU 3      ; 1 = C pressed first, waiting for #
  
 ; ---- Constants ----
  ZFLAG        EQU 2
  CFLAG        EQU 0
  PIN_LENGTH   EQU 4
- PIN_ADDR     EQU 0x10   ; PIN stored at EEPROM 0x10-0x13 (programmed by hand)
+ ENTRY_BYTES  EQU 12     ; pinBuf + newBuf, cleared together
  DEBOUNCE_TICKS EQU 20   ; ~20 ms (tick = 1.024 ms)
  BUZZ_TICKS   EQU 150    ; ~154 ms
  UNLOCK_L     EQU 0xD1   ; 977 ticks = 0x03D1 = ~1.0 s
  UNLOCK_H     EQU 0x03
  
+ ; ---- EEPROM map (five consecutive addresses) ----
+ PIN_ADDR     EQU 0x10   ; PIN digits 1-4 at 0x10, 0x11, 0x12, 0x13
+ MARKER_ADDR  EQU 0x14   ; PIN-valid marker
+ MARKER_VALID EQU 0xC4   ; 0xC4 = PIN valid, anything else = invalid
+ MARKER_CLEAR EQU 0x00   ; written first by PINWrite
+ 
+ ; ---- Modes and results ----
+ MODE_INVALID EQU 0
+ MODE_LOCKED  EQU 1
+ MODE_CHANGE  EQU 2
+ RES_BUSY     EQU 0
+ RES_OK       EQU 1
+ RES_FAIL     EQU 2
+ 
  KEY_STAR     EQU 0x2A
  KEY_POUND    EQU 0x23
+ KEY_C        EQU 0x43
  
 ; ---- Display status characters (ASCII) ----
- CH_LOCKED    EQU 0x4C   ; 'L' locked, waiting for entry
- CH_ERROR     EQU 0x45   ; 'E' rejected (wrong PIN, too short, fifth digit)
- CH_CANCEL    EQU 0x43   ; 'C' entry cancelled with *
+ CH_LOCKED    EQU 0x4C   ; 'L' normal locked mode, enter current PIN
  CH_OPEN      EQU 0x55   ; 'U' unlocked (during the 1 s output)
-                         ; '1'-'4' (0x31-0x34) = number of digits entered
+ CH_NEW       EQU 0x4E   ; 'N' enter NEW PIN (invalid mode / change mode)
+ CH_REPEAT    EQU 0x52   ; 'R' repeat the new PIN
+ CH_CURRENT   EQU 0x50   ; 'P' enter CURRENT PIN (change mode)
+ CH_SAVED     EQU 0x53   ; 'S' new PIN saved
+ CH_FAIL      EQU 0x46   ; 'F' entry rejected / cancelled
+ CH_EEERR     EQU 0x58   ; 'X' EEPROM write/verify error
  
 PSECT resetVect,class=CODE,delta=2
 ResetVector:
@@ -108,13 +139,14 @@ ResetVector:
 PSECT code,class=CODE,delta=2
  
 ; ----------------------------------------------------------------------------
-; SETUP - outputs are cleared BEFORE they are enabled, so the buzzer and
-; solenoid outputs are LOW at startup. No interrupts; TMR0 free-runs as a
+; SETUP - outputs are cleared BEFORE they are enabled, so the buzzer, solenoid
+; and error outputs are LOW at startup. No interrupts; TMR0 free-runs as a
 ; ~1.024 ms tick (4 MHz, prescaler 1:4) that the loop polls.
+; The PIN-valid marker selects the starting mode.
 ; ----------------------------------------------------------------------------
 Setup:
     BANKSEL PORTA
-    CLRF PORTA              ; buzzer and solenoid latches LOW first
+    CLRF PORTA              ; buzzer, solenoid, error latches LOW first
     CLRF PORTB              ; row output latches LOW
     CLRF PORTC
  
@@ -123,8 +155,8 @@ Setup:
     CLRF ANSELH
  
     BANKSEL TRISA
-    MOVLW 0xFC
-    MOVWF TRISA             ; RA0 buzzer, RA1 solenoid = outputs
+    MOVLW 0xF8
+    MOVWF TRISA             ; RA0 buzzer, RA1 solenoid, RA2 error = outputs
     MOVLW 0xFE
     MOVWF TRISB             ; RB0 row output (low), RB1-RB7 inputs
     CLRF TRISC              ; DLG7137 data
@@ -135,7 +167,7 @@ Setup:
  
     BANKSEL EECON1
     BCF EECON1,7            ; EEPGD = 0 -> data EEPROM
-    BCF EECON1,2            ; WREN = 0 (this lab never writes)
+    BCF EECON1,2            ; WREN = 0 (only EEPROMWrite turns it on)
  
     BANKSEL PORTA
     CLRF INTCON
@@ -156,9 +188,19 @@ Setup:
     CLRF ee_address
     CLRF ee_data
     CLRF ee_status
+    CLRF phase
+    CLRF wrIdx
     CALL ClearEntry         ; no digits collected after reset
-    MOVLW CH_LOCKED
-    MOVWF dispChar
+ 
+    MOVLW MARKER_ADDR       ; read the PIN-valid marker
+    MOVWF ee_address
+    CALL EEPROMRead
+    CLRF mode               ; assume MODE_INVALID
+    MOVLW MARKER_VALID
+    XORWF ee_data,W
+    BTFSC STATUS,ZFLAG
+    INCF mode,F             ; marker = 0xC4 -> MODE_LOCKED
+    CALL SetPrompt          ; 'N' or 'L'
  
 MainLoop:
     CALL ServiceTick
@@ -319,9 +361,9 @@ KeyBottom:
  
 ; ----------------------------------------------------------------------------
 ; SERVICE KEYS - handles one debounced press event.
-;   Every press beeps (100-250 ms), regardless of PIN result.
-;   While the solenoid output is active, PIN actions are ignored.
-;   0-9 add a digit, * cancels, # submits, A-D do nothing.
+;   Every press beeps (100-250 ms) in every mode.
+;   After an EEPROM error (pinFault) or during the solenoid pulse the key
+;   only beeps. Otherwise the key goes to the routine for the current mode.
 ; ----------------------------------------------------------------------------
 ServiceKeys:
     MOVF keyEvent,F
@@ -335,65 +377,87 @@ ServiceKeys:
     MOVLW BUZZ_TICKS
     MOVWF buzzCnt
  
+    BTFSC SysFlags,pinFault
+    RETURN                  ; EEPROM error: no more PIN attempts until reset
     BTFSC SysFlags,unlocked
     RETURN                  ; output active: no PIN entry
  
-    MOVF keyIn,W
-    XORLW KEY_STAR
+    MOVF entryCnt,F         ; first key of a new entry: show the prompt
+    BTFSS STATUS,ZFLAG
+    goto KeyDispatch
+    BTFSC SysFlags,cWait
+    goto KeyDispatch
+    CALL SetPrompt
+ 
+KeyDispatch:
+    MOVF mode,F
     BTFSC STATUS,ZFLAG
-    goto DoCancel
+    goto ModeInvalid
+    DECF mode,W
+    BTFSC STATUS,ZFLAG
+    goto ModeLocked
+    goto ModeChange
+ 
+; ---- Invalid PIN mode: NewPINMatch, then save. Solenoid never activates. ----
+ModeInvalid:
+    CALL NewPINMatch
+    MOVF result,W
+    XORLW RES_OK
+    BTFSC STATUS,ZFLAG
+    goto InvSave
+    MOVF result,W
+    XORLW RES_FAIL
+    BTFSS STATUS,ZFLAG
+    RETURN                  ; still busy
+    CALL ClearEntry         ; mismatch / * / unexpected key: restart, no save
+    MOVLW CH_FAIL
+    MOVWF dispChar
+    RETURN
+InvSave:
+    CALL PINWrite
+    goto SaveDone
+ 
+; ---- Normal locked mode: PIN unlocks, C then # starts a PIN change. ----
+ModeLocked:
+    BTFSS SysFlags,cWait
+    goto LockNoC
+    BCF SysFlags,cWait      ; C was pressed first: this key must be #
     MOVF keyIn,W
     XORLW KEY_POUND
-    BTFSC STATUS,ZFLAG
-    goto DoSubmit
- 
-    MOVLW 0x30
-    SUBWF keyIn,W           ; W = key - '0'
-    MOVWF digit
-    SUBLW 0x09              ; C = 1 if digit <= 9
-    BTFSS STATUS,CFLAG
-    RETURN                  ; A-D: no PIN-entry action
-    goto DoDigit
- 
-DoDigit:
-    BTFSC SysFlags,entryBad
-    RETURN                  ; already rejected: wait for # or *
-    MOVF pinCount,W
-    XORLW PIN_LENGTH
-    BTFSC STATUS,ZFLAG
-    goto DigitOverflow      ; this is a fifth digit
-    MOVLW pinBuf
-    ADDWF pinCount,W
-    MOVWF FSR
-    MOVF digit,W
-    MOVWF INDF              ; pinBuf[pinCount] = digit
-    INCF pinCount,F
-    MOVLW 0x30
-    ADDWF pinCount,W        ; show how many digits so far: '1'..'4'
-    MOVWF dispChar
-    RETURN
-DigitOverflow:
-    BSF SysFlags,entryBad   ; entry is now invalid, even if # follows
-    MOVLW CH_ERROR
-    MOVWF dispChar
-    RETURN
- 
-DoCancel:
+    BTFSS STATUS,ZFLAG
+    goto LockFail           ; C not followed by #: back to locked
+    MOVLW MODE_CHANGE
+    MOVWF mode
+    CLRF phase
     CALL ClearEntry
-    MOVLW CH_CANCEL
+    CALL SetPrompt          ; 'P'
+    RETURN
+LockNoC:
+    MOVF entryCnt,F
+    BTFSS STATUS,ZFLAG
+    goto LockPin            ; C is only special as the FIRST key
+    MOVF keyIn,W
+    XORLW KEY_C
+    BTFSS STATUS,ZFLAG
+    goto LockPin
+    BSF SysFlags,cWait
+    RETURN
+LockPin:
+    CALL CurrentPINMatch
+    MOVF result,W
+    XORLW RES_OK
+    BTFSC STATUS,ZFLAG
+    goto LockUnlock
+    MOVF result,W
+    XORLW RES_FAIL
+    BTFSS STATUS,ZFLAG
+    RETURN                  ; still busy
+LockFail:
+    CALL ClearEntry
+    MOVLW CH_FAIL
     MOVWF dispChar
     RETURN
- 
-DoSubmit:
-    BTFSC SysFlags,entryBad
-    goto Reject             ; had a fifth digit
-    MOVF pinCount,W
-    XORLW PIN_LENGTH
-    BTFSS STATUS,ZFLAG
-    goto Reject             ; fewer than four digits
-    CALL ComparePin         ; Z = 1 if all four digits match EEPROM
-    BTFSS STATUS,ZFLAG
-    goto Reject
+LockUnlock:
     CALL ClearEntry         ; correct: clear entry, start the 1 s pulse
     BSF PORTA,SOLENOID
     BSF SysFlags,unlocked
@@ -404,19 +468,101 @@ DoSubmit:
     MOVLW CH_OPEN
     MOVWF dispChar
     RETURN
-Reject:
+ 
+; ---- PIN change mode: CurrentPINMatch, then NewPINMatch, then save. ----
+; Solenoid never activates here. Any failure returns to locked, old PIN kept.
+ModeChange:
+    MOVF phase,F
+    BTFSS STATUS,ZFLAG
+    goto ChgNew
+    CALL CurrentPINMatch
+    MOVF result,W
+    XORLW RES_OK
+    BTFSC STATUS,ZFLAG
+    goto ChgAuthOk
+    MOVF result,W
+    XORLW RES_FAIL
+    BTFSS STATUS,ZFLAG
+    RETURN                  ; still busy
+    goto ChgCancel
+ChgAuthOk:
+    MOVLW 1                 ; current PIN correct: ask for the new PIN
+    MOVWF phase
     CALL ClearEntry
-    MOVLW CH_ERROR
+    CALL SetPrompt          ; 'N'
+    RETURN
+ChgNew:
+    CALL NewPINMatch
+    MOVF result,W
+    XORLW RES_OK
+    BTFSC STATUS,ZFLAG
+    goto ChgSave
+    MOVF result,W
+    XORLW RES_FAIL
+    BTFSS STATUS,ZFLAG
+    RETURN                  ; still busy
+ChgCancel:
+    CALL ToLocked           ; cancelled / mismatch / wrong PIN: no EEPROM write
+    MOVLW CH_FAIL
+    MOVWF dispChar
+    RETURN
+ChgSave:
+    CALL PINWrite
+    goto SaveDone
+ 
+; SAVEDONE - common end of a save (invalid mode and change mode).
+; If PINWrite stopped with an error the error display is kept.
+SaveDone:
+    CALL ClearEntry         ; never leave PIN digits in RAM
+    BTFSC SysFlags,pinFault
+    RETURN                  ; error: stay locked out, 'X' and RA2 already set
+    CALL ToLocked
+    MOVLW CH_SAVED
     MOVWF dispChar
     RETURN
  
-; CLEARENTRY - forget all collected digits and the "too long" flag.
+; TOLOCKED - go to normal locked mode with nothing half-entered.
+ToLocked:
+    MOVLW MODE_LOCKED
+    MOVWF mode
+    CLRF phase
+    BCF SysFlags,cWait
+    CALL ClearEntry
+    RETURN
+ 
+; SETPROMPT - show the prompt character for the current mode / phase.
+;   mode 0: 'N'   mode 1: 'L'   mode 2: 'P' (phase 0) or 'N' (phase 1)
+SetPrompt:
+    MOVF mode,F
+    BTFSC STATUS,ZFLAG
+    goto PromptNew
+    DECF mode,W
+    BTFSC STATUS,ZFLAG
+    goto PromptLocked
+    MOVF phase,F
+    BTFSS STATUS,ZFLAG
+    goto PromptNew
+    MOVLW CH_CURRENT
+    MOVWF dispChar
+    RETURN
+PromptLocked:
+    MOVLW CH_LOCKED
+    MOVWF dispChar
+    RETURN
+PromptNew:
+    MOVLW CH_NEW
+    MOVWF dispChar
+    RETURN
+ 
+; CLEARENTRY - forget all collected digits (current and new buffers),
+; the key count, the pointer and the result.
 ClearEntry:
-    CLRF pinCount
-    BCF SysFlags,entryBad
+    CLRF entryCnt
+    CLRF ptrIdx
+    CLRF result
     MOVLW pinBuf
     MOVWF FSR
-    MOVLW PIN_LENGTH
+    MOVLW ENTRY_BYTES
     MOVWF loopCnt
 ClrLoop:
     CLRF INDF
@@ -425,9 +571,66 @@ ClrLoop:
     goto ClrLoop
     RETURN
  
+; GETDIGIT - In: keyIn.  Out: digit = keyIn - '0', C = 1 if keyIn is 0-9.
+GetDigit:
+    MOVLW 0x30
+    SUBWF keyIn,W           ; W = key - '0'
+    MOVWF digit
+    SUBLW 0x09              ; C = 1 if digit <= 9
+    RETURN
+ 
+; ----------------------------------------------------------------------------
+; CURRENTPINMATCH - collects  d d d d #  one key per call (polled, so the
+; keypad is never blocked).  In: keyIn.
+;   Keys 1-4 : digit 0-9, stored at pinBuf[ptrIdx] through FSR/INDF, ptr++
+;   Key 5    : must be #. Not stored, pointer not advanced. Then ComparePin
+;              reads the stored PIN with EEPROMRead.
+;   * or any unexpected key aborts.
+; Out: result = RES_BUSY (need more keys), RES_OK (PIN matches),
+;               RES_FAIL (aborted or no match).
+; The caller decides what a match means (unlock, or authenticate a change).
+; ----------------------------------------------------------------------------
+CurrentPINMatch:
+    MOVF keyIn,W
+    XORLW KEY_STAR
+    BTFSC STATUS,ZFLAG
+    goto CurFail
+    MOVF entryCnt,W
+    XORLW PIN_LENGTH
+    BTFSC STATUS,ZFLAG
+    goto CurNeedPound       ; fifth key: must be #
+    CALL GetDigit
+    BTFSS STATUS,CFLAG
+    goto CurFail            ; not 0-9
+    MOVLW pinBuf
+    ADDWF ptrIdx,W
+    MOVWF FSR
+    MOVF digit,W
+    MOVWF INDF              ; pinBuf[ptrIdx] = digit
+    INCF ptrIdx,F
+    INCF entryCnt,F
+    MOVLW RES_BUSY
+    MOVWF result
+    RETURN
+CurNeedPound:
+    MOVF keyIn,W
+    XORLW KEY_POUND
+    BTFSS STATUS,ZFLAG
+    goto CurFail
+    CALL ComparePin         ; Z = 1 if all four digits match EEPROM
+    MOVLW RES_FAIL          ; (MOVLW does not change Z)
+    BTFSC STATUS,ZFLAG
+    MOVLW RES_OK
+    MOVWF result
+    RETURN
+CurFail:
+    MOVLW RES_FAIL
+    MOVWF result
+    RETURN
+ 
 ; COMPAREPIN - reads the stored PIN with EEPROMRead (PIN_ADDR..PIN_ADDR+3)
-; and compares it with the entered digits. All four digits are always
-; checked. Out: Z = 1 if they all match.
+; and compares it with pinBuf. All four digits are always checked.
+; Out: Z = 1 if they all match.
 ComparePin:
     CLRF mismatch
     CLRF cmpIdx
@@ -449,6 +652,156 @@ CmpLoop:
     goto CmpLoop
     MOVF mismatch,F         ; Z = 1 only if every digit matched
     RETURN
+ 
+; ----------------------------------------------------------------------------
+; NEWPINMATCH - collects  d d d d # d d d d #  one key per call.  In: keyIn.
+;   entryCnt counts every accepted key (0-9). Key numbers 5 and 10
+;   (entryCnt = 4 and 9 before the key) must be #. Digits go to
+;   newBuf[ptrIdx]; # is not stored and does not advance ptrIdx.
+;   * or any unexpected key aborts. After the final # the two groups of four
+;   digits are compared in RAM. This routine never writes EEPROM.
+; Out: result = RES_BUSY, RES_OK (both entries match), RES_FAIL.
+; ----------------------------------------------------------------------------
+NewPINMatch:
+    MOVF keyIn,W
+    XORLW KEY_STAR
+    BTFSC STATUS,ZFLAG
+    goto NewFail
+    MOVF entryCnt,W
+    XORLW 4
+    BTFSC STATUS,ZFLAG
+    goto NewNeedPound       ; fifth key
+    MOVF entryCnt,W
+    XORLW 9
+    BTFSC STATUS,ZFLAG
+    goto NewNeedPound       ; tenth key
+    CALL GetDigit
+    BTFSS STATUS,CFLAG
+    goto NewFail            ; not 0-9
+    MOVLW newBuf
+    ADDWF ptrIdx,W
+    MOVWF FSR
+    MOVF digit,W
+    MOVWF INDF              ; newBuf[ptrIdx] = digit
+    INCF ptrIdx,F
+    INCF entryCnt,F
+    MOVLW RES_BUSY
+    MOVWF result
+    RETURN
+NewNeedPound:
+    MOVF keyIn,W
+    XORLW KEY_POUND
+    BTFSS STATUS,ZFLAG
+    goto NewFail
+    INCF entryCnt,F         ; # counts as a key but is not stored
+    MOVF entryCnt,W
+    XORLW 10
+    BTFSC STATUS,ZFLAG
+    goto NewCompare         ; second # received
+    MOVLW CH_REPEAT         ; first # received: ask for the PIN again
+    MOVWF dispChar
+    MOVLW RES_BUSY
+    MOVWF result
+    RETURN
+NewCompare:
+    CLRF mismatch
+    CLRF cmpIdx
+NcLoop:
+    MOVLW newBuf
+    ADDWF cmpIdx,W
+    MOVWF FSR
+    MOVF INDF,W             ; digit from entry 1
+    MOVWF tmp
+    MOVLW PIN_LENGTH
+    ADDWF FSR,F             ; same digit position in entry 2
+    MOVF INDF,W
+    XORWF tmp,W             ; 0 if equal
+    IORWF mismatch,F
+    INCF cmpIdx,F
+    MOVF cmpIdx,W
+    XORLW PIN_LENGTH
+    BTFSS STATUS,ZFLAG
+    goto NcLoop
+    MOVF mismatch,F         ; Z = 1 only if every digit matched
+    MOVLW RES_FAIL
+    BTFSC STATUS,ZFLAG
+    MOVLW RES_OK
+    MOVWF result
+    RETURN
+NewFail:
+    MOVLW RES_FAIL
+    MOVWF result
+    RETURN
+ 
+; ----------------------------------------------------------------------------
+; PINWRITE - saves newBuf[0..3] as the new PIN with six EEPROM steps:
+;   0: marker = 0x00     1-4: PIN digits 1-4     5: marker = 0xC4
+; Called only after NewPINMatch succeeded (and CurrentPINMatch, for a change).
+; Blocks everything else on purpose: no tick, no keypad, no unlock.
+; Each step: EEPROMWrite, wait for WR = 0, EEPROMVerifyWrite, check
+; EEPROM_ERROR. On an error the sequence stops, the solenoid stays OFF, RA2
+; goes HIGH, 'X' is shown and pinFault locks out all PIN entry until reset.
+; ----------------------------------------------------------------------------
+PINWrite:
+    BSF SysFlags,PIN_UPDATE
+    BCF PORTA,SOLENOID      ; solenoid OFF while the PIN is being written
+    CLRF wrIdx
+PwLoop:
+    MOVF wrIdx,F
+    BTFSC STATUS,ZFLAG
+    goto PwMarkClear        ; step 0
+    MOVF wrIdx,W
+    XORLW 5
+    BTFSC STATUS,ZFLAG
+    goto PwMarkValid        ; step 5
+    MOVLW PIN_ADDR-1        ; steps 1-4: digit wrIdx
+    ADDWF wrIdx,W
+    MOVWF ee_address
+    MOVLW newBuf-1
+    ADDWF wrIdx,W
+    MOVWF FSR
+    MOVF INDF,W
+    MOVWF ee_data
+    goto PwStep
+PwMarkClear:
+    MOVLW MARKER_ADDR
+    MOVWF ee_address
+    MOVLW MARKER_CLEAR
+    MOVWF ee_data
+    goto PwStep
+PwMarkValid:
+    MOVLW MARKER_ADDR
+    MOVWF ee_address
+    MOVLW MARKER_VALID
+    MOVWF ee_data
+PwStep:
+    CALL EEPROMWrite        ; starts the write (skips a byte already correct)
+PwWait:
+    BANKSEL EECON1
+    BTFSC EECON1,1          ; WR = 1 while the write is running
+    goto PwWait
+    BANKSEL PORTA
+    CALL EEPROMVerifyWrite  ; read back and compare
+    BTFSC ee_status,EEPROM_ERROR
+    goto PwFail
+    INCF wrIdx,F
+    MOVF wrIdx,W
+    XORLW 6
+    BTFSS STATUS,ZFLAG
+    goto PwLoop
+    BCF SysFlags,PIN_UPDATE ; step 6 verified: done
+    BCF INTCON,2            ; drop the tick that piled up during the write
+    CLRF keyEvent
+    RETURN
+PwFail:
+    BSF SysFlags,pinFault   ; stop: no remaining bytes are written
+    BCF PORTA,SOLENOID
+    BSF PORTA,ERR_LED       ; PIN-error indicator
+    MOVLW CH_EEERR
+    MOVWF dispChar
+    BCF INTCON,2
+    CLRF keyEvent
+    RETURN                  ; PIN_UPDATE stays set; only a reset clears it
  
 ; ----------------------------------------------------------------------------
 ; SERVICE DISPLAY - DLG7137 on PORTC shows the one-character status.
@@ -475,6 +828,102 @@ EEPROMRead:
     MOVF EEDATA,W
     MOVWF ee_data
     BCF ee_status,EEPROM_READ
+    BANKSEL PORTA
+    RETURN
+ 
+; ============================================================================
+; EEPROMWRITE - Part 2 routine, interface unchanged
+; In:  ee_address, ee_data
+; Returns at once if EEPROM_WRITE or EEIF is set (ee_status unchanged).
+; Returns without writing if the stored byte already equals ee_data
+; (ee_data and any EEPROM_ERROR flag untouched).
+; Otherwise starts the protected write, sets EEPROM_WRITE, and returns
+; WITHOUT waiting. GIE is restored to its entry state.
+; ============================================================================
+EEPROMWrite:
+    BTFSC ee_status,EEPROM_WRITE
+    RETURN                  ; a write is already awaiting verification
+    BANKSEL PIR2
+    BTFSC PIR2,4
+    RETURN                  ; EEIF set: previous write not yet verified
+    
+    ; ---- compare stored byte with ee_data (ee_data is NOT overwritten) ----
+    BANKSEL EEADR
+    MOVF ee_address,W
+    MOVWF EEADR
+    BANKSEL EECON1
+    BCF EECON1,7            ; EEPGD = 0
+    BSF EECON1,0            ; RD = 1
+    BANKSEL EEDATA
+    MOVF EEDATA,W
+    XORWF ee_data,W         ; Z = 1 if stored byte == ee_data
+    BTFSC STATUS,2
+    goto WriteSkip          ; same value: no write, saves endurance
+ 
+    ; ---- different value: set up the write (still Bank 2) ----
+    MOVF ee_data,W
+    ;XORLW 0x01             ; TEST ONLY: uncomment to program a WRONG byte and
+                            ; force a verify failure (ee_data keeps the expected value)
+    MOVWF EEDATA            ; data to write (EEADR already loaded)
+    BANKSEL EECON1
+    BSF EECON1,2            ; WREN = 1
+    BSF ee_status,EEPROM_WRITE
+ 
+    ; ---- save GIE, then disable it ----
+    BCF ee_status,EEPROM_GIE
+    BTFSC INTCON,7
+    BSF ee_status,EEPROM_GIE
+    
+EEDisGIE:
+    BCF INTCON,7            ; GIE = 0
+    BTFSC INTCON,7          ; make sure it really cleared
+    goto EEDisGIE
+ 
+    ; ---- required unlock sequence: no other instructions in between ----
+    MOVLW 0x55
+    MOVWF EECON2
+    MOVLW 0xAA
+    MOVWF EECON2
+    BSF EECON1,1            ; WR = 1 starts the write
+    ; --------------------------------------------------------------------
+ 
+    BTFSC ee_status,EEPROM_GIE
+    BSF INTCON,7            ; restore GIE only if it was on at entry
+    BCF ee_status,EEPROM_GIE
+WriteSkip:
+    BANKSEL PORTA
+    RETURN
+ 
+; ============================================================================
+; EEPROMVERIFYWRITE - Part 2 routine, interface unchanged
+; Call after the hardware write finishes (EEIF = 1).
+; In:  ee_address, ee_data (expected value, not overwritten)
+; Match:    ee_status cleared (clears EEPROM_WRITE and any old EEPROM_ERROR).
+; Mismatch: EEPROM_WRITE cleared, EEPROM_ERROR set. No retry.
+; Always clears EEIF and WREN.
+; ============================================================================
+EEPROMVerifyWrite:
+    BANKSEL EEADR
+    MOVF ee_address,W
+    MOVWF EEADR
+    BANKSEL EECON1
+    BCF EECON1,7            ; EEPGD = 0
+    BSF EECON1,0            ; RD = 1
+    BANKSEL EEDATA
+    MOVF EEDATA,W
+    XORWF ee_data,W         ; Z = 1 if match
+    BTFSS STATUS,2
+    goto VerifyFail
+    CLRF ee_status          ; success: clear all status flags
+    goto VerifyDone
+VerifyFail:
+    BCF ee_status,EEPROM_WRITE
+    BSF ee_status,EEPROM_ERROR
+VerifyDone:
+    BANKSEL EECON1
+    BCF EECON1,2            ; WREN = 0
+    BANKSEL PIR2
+    BCF PIR2,4              ; clear EEIF
     BANKSEL PORTA
     RETURN
 End
